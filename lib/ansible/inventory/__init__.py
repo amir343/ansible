@@ -16,36 +16,44 @@
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
 #############################################
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
 
 import fnmatch
 import os
 import sys
 import re
+import stat
 import subprocess
 
-import ansible.constants as C
+from ansible import constants as C
+from ansible import errors
+
 from ansible.inventory.ini import InventoryParser
 from ansible.inventory.script import InventoryScript
 from ansible.inventory.dir import InventoryDirectory
 from ansible.inventory.group import Group
 from ansible.inventory.host import Host
-from ansible import errors
-from ansible import utils
+from ansible.plugins import vars_loader
+from ansible.utils.path import is_executable
+from ansible.utils.vars import combine_vars
 
 class Inventory(object):
     """
     Host inventory for ansible.
     """
 
-    __slots__ = [ 'host_list', 'groups', '_restriction', '_also_restriction', '_subset', 
-                  'parser', '_vars_per_host', '_vars_per_group', '_hosts_cache', '_groups_list',
-                  '_pattern_cache', '_vars_plugins', '_playbook_basedir']
+    #__slots__ = [ 'host_list', 'groups', '_restriction', '_also_restriction', '_subset',
+    #              'parser', '_vars_per_host', '_vars_per_group', '_hosts_cache', '_groups_list',
+    #              '_pattern_cache', '_vault_password', '_vars_plugins', '_playbook_basedir']
 
-    def __init__(self, host_list=C.DEFAULT_HOST_LIST):
+    def __init__(self, loader, variable_manager, host_list=C.DEFAULT_HOST_LIST):
 
         # the host file file, or script path, or list of hosts
         # if a list, inventory data will NOT be loaded
         self.host_list = host_list
+        self._loader = loader
+        self._variable_manager = variable_manager
 
         # caching to avoid repeated calculations, particularly with
         # external inventory scripts.
@@ -53,10 +61,10 @@ class Inventory(object):
         self._vars_per_host  = {}
         self._vars_per_group = {}
         self._hosts_cache    = {}
-        self._groups_list    = {} 
+        self._groups_list    = {}
         self._pattern_cache  = {}
 
-        # to be set by calling set_playbook_basedir by ansible-playbook
+        # to be set by calling set_playbook_basedir by playbook code
         self._playbook_basedir = None
 
         # the inventory object holds a list of groups
@@ -86,7 +94,7 @@ class Inventory(object):
                 else:
                     if ":" in x:
                         tokens = x.rsplit(":", 1)
-                        # if there is ':' in the address, then this is a ipv6
+                        # if there is ':' in the address, then this is an ipv6
                         if ':' in tokens[0]:
                             all.add_host(Host(x))
                         else:
@@ -97,7 +105,7 @@ class Inventory(object):
             if os.path.isdir(host_list):
                 # Ensure basedir is inside the directory
                 self.host_list = os.path.join(self.host_list, "")
-                self.parser = InventoryDirectory(filename=host_list)
+                self.parser = InventoryDirectory(loader=self._loader, filename=host_list)
                 self.groups = self.parser.groups.values()
             else:
                 # check to see if the specified file starts with a
@@ -113,9 +121,9 @@ class Inventory(object):
                 except:
                     pass
 
-                if utils.is_executable(host_list):
+                if is_executable(host_list):
                     try:
-                        self.parser = InventoryScript(filename=host_list)
+                        self.parser = InventoryScript(loader=self._loader, filename=host_list)
                         self.groups = self.parser.groups.values()
                     except:
                         if not shebang_present:
@@ -134,18 +142,49 @@ class Inventory(object):
                         else:
                             raise
 
-            utils.plugins.vars_loader.add_directory(self.basedir(), with_subdir=True)
+            vars_loader.add_directory(self.basedir(), with_subdir=True)
         else:
-            raise errors.AnsibleError("Unable to find an inventory file, specify one with -i ?")
+            raise errors.AnsibleError("Unable to find an inventory file (%s), "
+                                      "specify one with -i ?" % host_list)
 
-        self._vars_plugins = [ x for x in utils.plugins.vars_loader.all(self) ]
+        self._vars_plugins = [ x for x in vars_loader.all(self) ]
+
+        # FIXME: shouldn't be required, since the group/host vars file
+        #        management will be done in VariableManager
+        # get group vars from group_vars/ files and vars plugins
+        for group in self.groups:
+            # FIXME: combine_vars
+            group.vars = combine_vars(group.vars, self.get_group_variables(group.name))
+
+        # get host vars from host_vars/ files and vars plugins
+        for host in self.get_hosts():
+            # FIXME: combine_vars
+            host.vars = combine_vars(host.vars, self.get_host_variables(host.name))
 
 
     def _match(self, str, pattern_str):
-        if pattern_str.startswith('~'):
-            return re.search(pattern_str[1:], str)
-        else:
-            return fnmatch.fnmatch(str, pattern_str)
+        try:
+            if pattern_str.startswith('~'):
+                return re.search(pattern_str[1:], str)
+            else:
+                return fnmatch.fnmatch(str, pattern_str)
+        except Exception, e:
+            raise errors.AnsibleError('invalid host pattern: %s' % pattern_str)
+
+    def _match_list(self, items, item_attr, pattern_str):
+        results = []
+        try:
+            if not pattern_str.startswith('~'):
+                pattern = re.compile(fnmatch.translate(pattern_str))
+            else:
+                pattern = re.compile(pattern_str[1:])
+        except Exception, e:
+            raise errors.AnsibleError('invalid host pattern: %s' % pattern_str)
+
+        for item in items:
+            if pattern.match(getattr(item, item_attr)):
+                results.append(item)
+        return results
 
     def get_hosts(self, pattern="all"):
         """ 
@@ -166,9 +205,9 @@ class Inventory(object):
 
         # exclude hosts mentioned in any restriction (ex: failed hosts)
         if self._restriction is not None:
-            hosts = [ h for h in hosts if h.name in self._restriction ]
+            hosts = [ h for h in hosts if h in self._restriction ]
         if self._also_restriction is not None:
-            hosts = [ h for h in hosts if h.name in self._also_restriction ]
+            hosts = [ h for h in hosts if h in self._also_restriction ]
 
         return hosts
 
@@ -187,7 +226,7 @@ class Inventory(object):
                 pattern_exclude.append(p)
             elif p.startswith("&"):
                 pattern_intersection.append(p)
-            else:
+            elif p:
                 pattern_regular.append(p)
 
         # if no regular pattern was given, hence only exclude and/or intersection
@@ -202,20 +241,23 @@ class Inventory(object):
         hosts = []
 
         for p in patterns:
-            that = self.__get_hosts(p)
-            if p.startswith("!"):
-                hosts = [ h for h in hosts if h not in that ]
-            elif p.startswith("&"):
-                hosts = [ h for h in hosts if h in that ]
+            # avoid resolving a pattern that is a plain host
+            if p in self._hosts_cache:
+                hosts.append(self.get_host(p))
             else:
-                to_append = [ h for h in that if h.name not in [ y.name for y in hosts ] ]
-                hosts.extend(to_append)
-        
+                that = self.__get_hosts(p)
+                if p.startswith("!"):
+                    hosts = [ h for h in hosts if h not in that ]
+                elif p.startswith("&"):
+                    hosts = [ h for h in hosts if h in that ]
+                else:
+                    to_append = [ h for h in that if h.name not in [ y.name for y in hosts ] ]
+                    hosts.extend(to_append)
         return hosts
 
     def __get_hosts(self, pattern):
         """ 
-        finds hosts that postively match a particular pattern.  Does not
+        finds hosts that positively match a particular pattern.  Does not
         take into account negative matches.
         """
 
@@ -234,6 +276,10 @@ class Inventory(object):
         which parts of it correspond to start/stop offsets.  limits is
         a tuple of (start, stop) or None
         """
+
+        # Do not parse regexes for enumeration info
+        if pattern.startswith('~'):
+            return (pattern, None)
 
         # The regex used to match on the range, which can be [x] or [x-y].
         pattern_re = re.compile("^(.*)\[([-]?[0-9]+)(?:(?:-)([0-9]+))?\](.*)$")
@@ -287,32 +333,46 @@ class Inventory(object):
         new_host = Host(pattern)
         new_host.set_variable("ansible_python_interpreter", sys.executable)
         new_host.set_variable("ansible_connection", "local")
+        new_host.ipv4_address = '127.0.0.1'
+
         ungrouped = self.get_group("ungrouped")
         if ungrouped is None:
             self.add_group(Group('ungrouped'))
             ungrouped = self.get_group('ungrouped')
+            self.get_group('all').add_child_group(ungrouped)
         ungrouped.add_host(new_host)
         return new_host
 
     def _hosts_in_unenumerated_pattern(self, pattern):
         """ Get all host names matching the pattern """
 
+        results = []
         hosts = []
         hostnames = set()
 
         # ignore any negative checks here, this is handled elsewhere
         pattern = pattern.replace("!","").replace("&", "")
 
-        results = []
+        def __append_host_to_results(host):
+            if host not in results and host.name not in hostnames:
+                hostnames.add(host.name)
+                results.append(host)
+
         groups = self.get_groups()
         for group in groups:
-            for host in group.get_hosts():
-                if pattern == 'all' or self._match(group.name, pattern) or self._match(host.name, pattern):
-                    if host not in results and host.name not in hostnames:
-                        results.append(host)
-                        hostnames.add(host.name)
+            if pattern == 'all':
+                for host in group.get_hosts():
+                    __append_host_to_results(host)
+            else:
+                if self._match(group.name, pattern) and group.name not in ('all', 'ungrouped'):
+                    for host in group.get_hosts():
+                        __append_host_to_results(host)
+                else:
+                    matching_hosts = self._match_list(group.get_hosts(), 'name', pattern)
+                    for host in matching_hosts:
+                        __append_host_to_results(host)
 
-        if pattern in ["localhost", "127.0.0.1"] and len(results) == 0:
+        if pattern in ["localhost", "127.0.0.1", "::1"] and len(results) == 0:
             new_host = self._create_implicit_localhost(pattern)
             results.append(new_host)
         return results
@@ -322,14 +382,10 @@ class Inventory(object):
         self._pattern_cache = {}
 
     def groups_for_host(self, host):
-        results = []
-        groups = self.get_groups()
-        for group in groups:
-            for hostn in group.get_hosts():
-                if host == hostn.name:
-                    results.append(group)
-                    continue
-        return results
+        if host in self._hosts_cache:
+            return self._hosts_cache[host].get_groups()
+        else:
+            return []
 
     def groups_list(self):
         if not self._groups_list:
@@ -352,9 +408,9 @@ class Inventory(object):
         return self._hosts_cache[hostname]
 
     def _get_host(self, hostname):
-        if hostname in ['localhost','127.0.0.1']:
+        if hostname in ['localhost', '127.0.0.1', '::1']:
             for host in self.get_group('all').get_hosts():
-                if host.name in ['localhost', '127.0.0.1']:
+                if host.name in ['localhost', '127.0.0.1', '::1']:
                     return host
             return self._create_implicit_localhost(hostname)
         else:
@@ -370,60 +426,100 @@ class Inventory(object):
                 return group
         return None
 
-    def get_group_variables(self, groupname):
-        if groupname not in self._vars_per_group:
-            self._vars_per_group[groupname] = self._get_group_variables(groupname)
+    def get_group_variables(self, groupname, update_cached=False, vault_password=None):
+        if groupname not in self._vars_per_group or update_cached:
+            self._vars_per_group[groupname] = self._get_group_variables(groupname, vault_password=vault_password)
         return self._vars_per_group[groupname]
 
-    def _get_group_variables(self, groupname):
+    def _get_group_variables(self, groupname, vault_password=None):
+
         group = self.get_group(groupname)
         if group is None:
             raise Exception("group not found: %s" % groupname)
-        return group.get_variables()
 
-    def get_variables(self, hostname, vault_password=None):
-        if hostname not in self._vars_per_host:
-            self._vars_per_host[hostname] = self._get_variables(hostname, vault_password=vault_password)
+        vars = {}
+
+        # plugin.get_group_vars retrieves just vars for specific group
+        vars_results = [ plugin.get_group_vars(group, vault_password=vault_password) for plugin in self._vars_plugins if hasattr(plugin, 'get_group_vars')]
+        for updated in vars_results:
+            if updated is not None:
+                # FIXME: combine_vars
+                vars = combine_vars(vars, updated)
+
+        # Read group_vars/ files
+        # FIXME: combine_vars
+        vars = combine_vars(vars, self.get_group_vars(group))
+
+        return vars
+
+    def get_vars(self, hostname, update_cached=False, vault_password=None):
+
+        host = self.get_host(hostname)
+        if not host:
+            raise Exception("host not found: %s" % hostname)
+        return host.get_vars()
+
+    def get_host_variables(self, hostname, update_cached=False, vault_password=None):
+
+        if hostname not in self._vars_per_host or update_cached:
+            self._vars_per_host[hostname] = self._get_host_variables(hostname, vault_password=vault_password)
         return self._vars_per_host[hostname]
 
-    def _get_variables(self, hostname, vault_password=None):
+    def _get_host_variables(self, hostname, vault_password=None):
 
         host = self.get_host(hostname)
         if host is None:
             raise errors.AnsibleError("host not found: %s" % hostname)
 
         vars = {}
-        vars_results = [ plugin.run(host, vault_password=vault_password) for plugin in self._vars_plugins ] 
+
+        # plugin.run retrieves all vars (also from groups) for host
+        vars_results = [ plugin.run(host, vault_password=vault_password) for plugin in self._vars_plugins if hasattr(plugin, 'run')]
         for updated in vars_results:
             if updated is not None:
-                vars = utils.combine_vars(vars, updated)
+                # FIXME: combine_vars
+                vars = combine_vars(vars, updated)
 
-        vars = utils.combine_vars(vars, host.get_variables())
+        # plugin.get_host_vars retrieves just vars for specific host
+        vars_results = [ plugin.get_host_vars(host, vault_password=vault_password) for plugin in self._vars_plugins if hasattr(plugin, 'get_host_vars')]
+        for updated in vars_results:
+            if updated is not None:
+                # FIXME: combine_vars
+                vars = combine_vars(vars, updated)
+
+        # still need to check InventoryParser per host vars
+        # which actually means InventoryScript per host,
+        # which is not performant
         if self.parser is not None:
-            vars = utils.combine_vars(vars, self.parser.get_host_variables(host))
+            # FIXME: combine_vars
+            vars = combine_vars(vars, self.parser.get_host_variables(host))
+
+        # Read host_vars/ files
+        # FIXME: combine_vars
+        vars = combine_vars(vars, self.get_host_vars(host))
+
         return vars
 
     def add_group(self, group):
-        self.groups.append(group)
-        self._groups_list = None  # invalidate internal cache 
+        if group.name not in self.groups_list():
+            self.groups.append(group)
+            self._groups_list = None  # invalidate internal cache 
+        else:
+            raise errors.AnsibleError("group already in inventory: %s" % group.name)
 
     def list_hosts(self, pattern="all"):
 
         """ return a list of hostnames for a pattern """
 
-        result = [ h.name for h in self.get_hosts(pattern) ]
-        if len(result) == 0 and pattern in ["localhost", "127.0.0.1"]:
+        result = [ h for h in self.get_hosts(pattern) ]
+        if len(result) == 0 and pattern in ["localhost", "127.0.0.1", "::1"]:
             result = [pattern]
         return result
 
     def list_groups(self):
         return sorted([ g.name for g in self.groups ], key=lambda x: x)
 
-    # TODO: remove this function
-    def get_restriction(self):
-        return self._restriction
-
-    def restrict_to(self, restriction):
+    def restrict_to_hosts(self, restriction):
         """ 
         Restrict list operations to the hosts given in restriction.  This is used
         to exclude failed hosts in main playbook code, don't use this for other
@@ -465,7 +561,7 @@ class Inventory(object):
                     results.append(x)
             self._subset = results
 
-    def lift_restriction(self):
+    def remove_restriction(self):
         """ Do not restrict list operations """
         self._restriction = None
     
@@ -500,10 +596,78 @@ class Inventory(object):
         return self._playbook_basedir
 
     def set_playbook_basedir(self, dir):
-        """ 
-        sets the base directory of the playbook so inventory plugins can use it to find
-        variable files and other things. 
         """
-        self._playbook_basedir = dir
+        sets the base directory of the playbook so inventory can use it as a
+        basedir for host_ and group_vars, and other things.
+        """
+        # Only update things if dir is a different playbook basedir
+        if dir != self._playbook_basedir:
+            self._playbook_basedir = dir
+            # get group vars from group_vars/ files
+            for group in self.groups:
+                # FIXME: combine_vars
+                group.vars = combine_vars(group.vars, self.get_group_vars(group, new_pb_basedir=True))
+            # get host vars from host_vars/ files
+            for host in self.get_hosts():
+                # FIXME: combine_vars
+                host.vars = combine_vars(host.vars, self.get_host_vars(host, new_pb_basedir=True))
+            # invalidate cache
+            self._vars_per_host = {}
+            self._vars_per_group = {}
 
+    def get_host_vars(self, host, new_pb_basedir=False):
+        """ Read host_vars/ files """
+        return self._get_hostgroup_vars(host=host, group=None, new_pb_basedir=new_pb_basedir)
+
+    def get_group_vars(self, group, new_pb_basedir=False):
+        """ Read group_vars/ files """
+        return self._get_hostgroup_vars(host=None, group=group, new_pb_basedir=new_pb_basedir)
+
+    def _get_hostgroup_vars(self, host=None, group=None, new_pb_basedir=False):
+        """
+        Loads variables from group_vars/<groupname> and host_vars/<hostname> in directories parallel
+        to the inventory base directory or in the same directory as the playbook.  Variables in the playbook
+        dir will win over the inventory dir if files are in both.
+        """
+
+        results = {}
+        scan_pass = 0
+        _basedir = self.basedir()
+
+        # look in both the inventory base directory and the playbook base directory
+        # unless we do an update for a new playbook base dir
+        if not new_pb_basedir:
+            basedirs = [_basedir, self._playbook_basedir]
+        else:
+            basedirs = [self._playbook_basedir]
+
+        for basedir in basedirs:
+
+            # this can happen from particular API usages, particularly if not run
+            # from /usr/bin/ansible-playbook
+            if basedir is None:
+                continue
+
+            scan_pass = scan_pass + 1
+
+            # it's not an eror if the directory does not exist, keep moving
+            if not os.path.exists(basedir):
+                continue
+
+            # save work of second scan if the directories are the same
+            if _basedir == self._playbook_basedir and scan_pass != 1:
+                continue
+
+            # FIXME: these should go to VariableManager
+            if group and host is None:
+                # load vars in dir/group_vars/name_of_group
+                base_path = os.path.join(basedir, "group_vars/%s" % group.name)
+                results = self._variable_manager.add_group_vars_file(base_path, self._loader)
+            elif host and group is None:
+                # same for hostvars in dir/host_vars/name_of_host
+                base_path = os.path.join(basedir, "host_vars/%s" % host.name)
+                results = self._variable_manager.add_host_vars_file(base_path, self._loader)
+
+        # all done, results is a dictionary of variables for this particular host.
+        return results
 

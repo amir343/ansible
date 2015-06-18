@@ -27,12 +27,6 @@
 # USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 try:
-    import urllib
-    HAS_URLLIB = True
-except:
-    HAS_URLLIB = False
-
-try:
     import urllib2
     HAS_URLLIB2 = True
 except:
@@ -50,9 +44,21 @@ try:
 except:
     HAS_SSL=False
 
+HAS_MATCH_HOSTNAME = True
+try:
+    from ssl import match_hostname, CertificateError
+except ImportError:
+    try:
+        from backports.ssl_match_hostname import match_hostname, CertificateError
+    except ImportError:
+        HAS_MATCH_HOSTNAME = False
+
+import httplib
 import os
 import re
+import sys
 import socket
+import platform
 import tempfile
 
 
@@ -78,6 +84,47 @@ qFy+aenWXsC0ZvrikFxbQnX8GVtDADtVznxOi7XzFw7JOxdsVrpXgSN0eh0aMzvV
 zKPZsZ2miVGclicJHzm5q080b1p/sZtuKIEZk6vZqEg=
 -----END CERTIFICATE-----
 """
+
+#
+# Exceptions
+#
+
+class ConnectionError(Exception):
+    """Failed to connect to the server"""
+    pass
+
+class ProxyError(ConnectionError):
+    """Failure to connect because of a proxy"""
+    pass
+
+class SSLValidationError(ConnectionError):
+    """Failure to connect due to SSL validation failing"""
+    pass
+
+class NoSSLError(SSLValidationError):
+    """Needed to connect to an HTTPS url but no ssl library available to verify the certificate"""
+    pass
+
+
+class CustomHTTPSConnection(httplib.HTTPSConnection):
+    def connect(self):
+        "Connect to a host on a given (SSL) port."
+
+        if hasattr(self, 'source_address'):
+            sock = socket.create_connection((self.host, self.port), self.timeout, self.source_address)
+        else:
+            sock = socket.create_connection((self.host, self.port), self.timeout)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        self.sock = ssl.wrap_socket(sock, keyfile=self.key_file, certfile=self.cert_file, ssl_version=ssl.PROTOCOL_TLSv1)
+
+class CustomHTTPSHandler(urllib2.HTTPSHandler):
+
+    def https_open(self, req):
+        return self.do_open(CustomHTTPSConnection, req)
+
+    https_request = urllib2.AbstractHTTPHandler.do_request_
 
 def generic_urlparse(parts):
     '''
@@ -123,7 +170,7 @@ def generic_urlparse(parts):
                 username, password = auth.split(':', 1)
             generic_parts['username'] = username
             generic_parts['password'] = password
-            generic_parts['hostname'] = hostnme
+            generic_parts['hostname'] = hostname
             generic_parts['port']     = port
         except:
             generic_parts['username'] = None
@@ -159,8 +206,7 @@ class SSLValidationHandler(urllib2.BaseHandler):
     '''
     CONNECT_COMMAND = "CONNECT %s:%s HTTP/1.0\r\nConnection: close\r\n"
 
-    def __init__(self, module, hostname, port):
-        self.module = module
+    def __init__(self, hostname, port):
         self.hostname = hostname
         self.port = port
 
@@ -170,22 +216,23 @@ class SSLValidationHandler(urllib2.BaseHandler):
 
         ca_certs = []
         paths_checked = []
-        platform = get_platform()
-        distribution = get_distribution()
 
+        system = platform.system()
         # build a list of paths to check for .crt/.pem files
         # based on the platform type
         paths_checked.append('/etc/ssl/certs')
-        if platform == 'Linux':
+        if system == 'Linux':
             paths_checked.append('/etc/pki/ca-trust/extracted/pem')
             paths_checked.append('/etc/pki/tls/certs')
             paths_checked.append('/usr/share/ca-certificates/cacert.org')
-        elif platform == 'FreeBSD':
+        elif system == 'FreeBSD':
             paths_checked.append('/usr/local/share/certs')
-        elif platform == 'OpenBSD':
+        elif system == 'OpenBSD':
             paths_checked.append('/etc/ssl')
-        elif platform == 'NetBSD':
+        elif system == 'NetBSD':
             ca_certs.append('/etc/openssl/certs')
+        elif system == 'SunOS':
+            paths_checked.append('/opt/local/etc/openssl/certs')
 
         # fall back to a user-deployed cert in a standard
         # location if the OS platform one is not available
@@ -194,8 +241,10 @@ class SSLValidationHandler(urllib2.BaseHandler):
         tmp_fd, tmp_path = tempfile.mkstemp()
 
         # Write the dummy ca cert if we are running on Mac OS X
-        if platform == 'Darwin':
+        if system == 'Darwin':
             os.write(tmp_fd, DUMMY_CA_CERT)
+            # Default Homebrew path for OpenSSL certs 
+            paths_checked.append('/usr/local/etc/openssl')
 
         # for all of the paths, find any  .crt or .pem files
         # and compile them into single temp file for use
@@ -225,11 +274,35 @@ class SSLValidationHandler(urllib2.BaseHandler):
             if int(resp_code) not in valid_codes:
                 raise Exception
         except:
-            self.module.fail_json(msg='Connection to proxy failed')
+            raise ProxyError('Connection to proxy failed')
+
+    def detect_no_proxy(self, url):
+        '''
+        Detect if the 'no_proxy' environment variable is set and honor those locations.
+        '''
+        env_no_proxy = os.environ.get('no_proxy')
+        if env_no_proxy:
+            env_no_proxy = env_no_proxy.split(',')
+            netloc = urlparse.urlparse(url).netloc
+
+            for host in env_no_proxy:
+                if netloc.endswith(host) or netloc.split(':')[0].endswith(host):
+                    # Our requested URL matches something in no_proxy, so don't
+                    # use the proxy for this
+                    return False
+        return True
 
     def http_request(self, req):
         tmp_ca_cert_path, paths_checked = self.get_ca_certs()
         https_proxy = os.environ.get('https_proxy')
+
+        # Detect if 'no_proxy' environment variable is set and if our URL is included
+        use_proxy = self.detect_no_proxy(req.get_full_url())
+
+        if not use_proxy:
+            # ignore proxy settings for this host request
+            return req
+
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             if https_proxy:
@@ -244,24 +317,28 @@ class SSLValidationHandler(urllib2.BaseHandler):
                     connect_result = s.recv(4096)
                     self.validate_proxy_response(connect_result)
                     ssl_s = ssl.wrap_socket(s, ca_certs=tmp_ca_cert_path, cert_reqs=ssl.CERT_REQUIRED)
+                    match_hostname(ssl_s.getpeercert(), self.hostname)
                 else:
-                    self.module.fail_json(msg='Unsupported proxy scheme: %s. Currently ansible only supports HTTP proxies.' % proxy_parts.get('scheme'))
+                    raise ProxyError('Unsupported proxy scheme: %s. Currently ansible only supports HTTP proxies.' % proxy_parts.get('scheme'))
             else:
                 s.connect((self.hostname, self.port))
                 ssl_s = ssl.wrap_socket(s, ca_certs=tmp_ca_cert_path, cert_reqs=ssl.CERT_REQUIRED)
+                match_hostname(ssl_s.getpeercert(), self.hostname)
             # close the ssl connection
             #ssl_s.unwrap()
             s.close()
         except (ssl.SSLError, socket.error), e:
             # fail if we tried all of the certs but none worked
             if 'connection refused' in str(e).lower():
-                self.module.fail_json(msg='Failed to connect to %s:%s.' % (self.hostname, self.port))
+                raise ConnectionError('Failed to connect to %s:%s.' % (self.hostname, self.port))
             else:
-                self.module.fail_json(
-                    msg='Failed to validate the SSL certificate for %s:%s. ' % (self.hostname, self.port) + \
-                    'Use validate_certs=no or make sure your managed systems have a valid CA certificate installed. ' + \
-                    'Paths checked for this platform: %s' % ", ".join(paths_checked)
+                raise SSLValidationError('Failed to validate the SSL certificate for %s:%s. '
+                    'Use validate_certs=False (insecure) or make sure your managed systems have a valid CA certificate installed. '
+                    'Paths checked for this platform: %s' % (self.hostname, self.port, ", ".join(paths_checked))
                 )
+        except CertificateError:
+            raise SSLValidationError("SSL Certificate does not belong to %s.  Make sure the url has a certificate that belongs to it or use validate_certs=False (insecure)" % self.hostname)
+
         try:
             # cleanup the temp file created, don't worry
             # if it fails for some reason
@@ -273,73 +350,44 @@ class SSLValidationHandler(urllib2.BaseHandler):
 
     https_request = http_request
 
-
-def url_argument_spec():
-    '''
-    Creates an argument spec that can be used with any module
-    that will be requesting content via urllib/urllib2
-    '''
-    return dict(
-        url = dict(),
-        force = dict(default='no', aliases=['thirsty'], type='bool'),
-        http_agent = dict(default='ansible-httpget'),
-        use_proxy = dict(default='yes', type='bool'),
-        validate_certs = dict(default='yes', type='bool'),
-        url_username = dict(required=False),
-        url_password = dict(required=False),
-    )
-
-
-def fetch_url(module, url, data=None, headers=None, method=None, 
-              use_proxy=True, force=False, last_mod_time=None, timeout=10):
+# Rewrite of fetch_url to not require the module environment
+def open_url(url, data=None, headers=None, method=None, use_proxy=True,
+        force=False, last_mod_time=None, timeout=10, validate_certs=True,
+        url_username=None, url_password=None, http_agent=None):
     '''
     Fetches a file from an HTTP/FTP server using urllib2
     '''
-
-    if not HAS_URLLIB:
-        module.fail_json(msg='urllib is not installed')
-    if not HAS_URLLIB2:
-        module.fail_json(msg='urllib2 is not installed')
-    elif not HAS_URLPARSE:
-        module.fail_json(msg='urlparse is not installed')
-
-    r = None
     handlers = []
-    info = dict(url=url)
-
-    distribution = get_distribution()
-    # Get validate_certs from the module params
-    validate_certs = module.params.get('validate_certs', True)
 
     # FIXME: change the following to use the generic_urlparse function
     #        to remove the indexed references for 'parsed'
     parsed = urlparse.urlparse(url)
-    if parsed[0] == 'https':
-        if not HAS_SSL and validate_certs:
-            if distribution == 'Redhat':
-                module.fail_json(msg='SSL validation is not available in your version of python. You can use validate_certs=no, however this is unsafe and not recommended. You can also install python-ssl from EPEL')
-            else:
-                module.fail_json(msg='SSL validation is not available in your version of python. You can use validate_certs=no, however this is unsafe and not recommended')
+    if parsed[0] == 'https' and validate_certs:
+        if not HAS_SSL:
+            raise NoSSLError('SSL validation is not available in your version of python. You can use validate_certs=False, however this is unsafe and not recommended')
+        if not HAS_MATCH_HOSTNAME:
+            raise SSLValidationError('Available SSL validation does not check that the certificate matches the hostname.  You can install backports.ssl_match_hostname or update your managed machine to python-2.7.9 or newer.  You could also use validate_certs=False, however this is unsafe and not recommended')
 
-        elif validate_certs:
-            # do the cert validation
-            netloc = parsed[1]
-            if '@' in netloc:
-                netloc = netloc.split('@', 1)[1]
-            if ':' in netloc:
-                hostname, port = netloc.split(':', 1)
-            else:
-                hostname = netloc
-                port = 443
-            # create the SSL validation handler and
-            # add it to the list of handlers
-            ssl_handler = SSLValidationHandler(module, hostname, port)
-            handlers.append(ssl_handler)
+        # do the cert validation
+        netloc = parsed[1]
+        if '@' in netloc:
+            netloc = netloc.split('@', 1)[1]
+        if ':' in netloc:
+            hostname, port = netloc.split(':', 1)
+            port = int(port)
+        else:
+            hostname = netloc
+            port = 443
+        # create the SSL validation handler and
+        # add it to the list of handlers
+        ssl_handler = SSLValidationHandler(hostname, port)
+        handlers.append(ssl_handler)
 
     if parsed[0] != 'ftp':
-        username = module.params.get('url_username', '')
+        username = url_username
+
         if username:
-            password = module.params.get('url_password', '')
+            password = url_password
             netloc = parsed[1]
         elif '@' in parsed[1]:
             credentials, netloc = parsed[1].split('@', 1)
@@ -373,19 +421,24 @@ def fetch_url(module, url, data=None, headers=None, method=None,
         proxyhandler = urllib2.ProxyHandler({})
         handlers.append(proxyhandler)
 
+    # pre-2.6 versions of python cannot use the custom https
+    # handler, since the socket class is lacking this method
+    if hasattr(socket, 'create_connection'):
+        handlers.append(CustomHTTPSHandler)
+
     opener = urllib2.build_opener(*handlers)
     urllib2.install_opener(opener)
 
     if method:
         if method.upper() not in ('OPTIONS','GET','HEAD','POST','PUT','DELETE','TRACE','CONNECT'):
-            module.fail_json(msg='invalid HTTP request method; %s' % method.upper())
+            raise ConnectionError('invalid HTTP request method; %s' % method.upper())
         request = RequestWithMethod(url, method.upper(), data)
     else:
         request = urllib2.Request(url, data)
 
     # add the custom agent header, to help prevent issues 
     # with sites that block the default urllib agent string 
-    request.add_header('User-agent', module.params.get('http_agent'))
+    request.add_header('User-agent', http_agent)
 
     # if we're ok with getting a 304, set the timestamp in the 
     # header, otherwise make sure we don't get a cached copy
@@ -398,25 +451,80 @@ def fetch_url(module, url, data=None, headers=None, method=None,
     # user defined headers now, which may override things we've set above
     if headers:
         if not isinstance(headers, dict):
-            module.fail_json("headers provided to fetch_url() must be a dict")
+            raise ValueError("headers provided to fetch_url() must be a dict")
         for header in headers:
             request.add_header(header, headers[header])
 
+    if sys.version_info < (2,6,0):
+        # urlopen in python prior to 2.6.0 did not
+        # have a timeout parameter
+        r = urllib2.urlopen(request, None)
+    else:
+        r = urllib2.urlopen(request, None, timeout)
+
+    return r
+
+#
+# Module-related functions
+#
+
+def url_argument_spec():
+    '''
+    Creates an argument spec that can be used with any module
+    that will be requesting content via urllib/urllib2
+    '''
+    return dict(
+        url = dict(),
+        force = dict(default='no', aliases=['thirsty'], type='bool'),
+        http_agent = dict(default='ansible-httpget'),
+        use_proxy = dict(default='yes', type='bool'),
+        validate_certs = dict(default='yes', type='bool'),
+        url_username = dict(required=False),
+        url_password = dict(required=False),
+    )
+
+def fetch_url(module, url, data=None, headers=None, method=None, 
+              use_proxy=True, force=False, last_mod_time=None, timeout=10):
+    '''
+    Fetches a file from an HTTP/FTP server using urllib2.  Requires the module environment
+    '''
+
+    if not HAS_URLLIB2:
+        module.fail_json(msg='urllib2 is not installed')
+    elif not HAS_URLPARSE:
+        module.fail_json(msg='urlparse is not installed')
+
+    # Get validate_certs from the module params
+    validate_certs = module.params.get('validate_certs', True)
+
+    username = module.params.get('url_username', '')
+    password = module.params.get('url_password', '')
+    http_agent = module.params.get('http_agent', None)
+
+    r = None
+    info = dict(url=url)
     try:
-        if sys.version_info < (2,6,0):
-            # urlopen in python prior to 2.6.0 did not
-            # have a timeout parameter
-            r = urllib2.urlopen(request, None)
-        else:
-            r = urllib2.urlopen(request, None, timeout)
+        r = open_url(url, data=None, headers=None, method=None,
+                use_proxy=True, force=False, last_mod_time=None, timeout=10,
+                validate_certs=validate_certs, url_username=username,
+                url_password=password, http_agent=http_agent)
         info.update(r.info())
         info['url'] = r.geturl()  # The URL goes in too, because of redirects.
         info.update(dict(msg="OK (%s bytes)" % r.headers.get('Content-Length', 'unknown'), status=200))
+    except NoSSLError, e:
+        distribution = get_distribution()
+        if distribution.lower() == 'redhat':
+            module.fail_json(msg='%s. You can also install python-ssl from EPEL' % str(e))
+    except (ConnectionError, ValueError), e:
+        module.fail_json(msg=str(e))
     except urllib2.HTTPError, e:
         info.update(dict(msg=str(e), status=e.code))
     except urllib2.URLError, e:
         code = int(getattr(e, 'code', -1))
         info.update(dict(msg="Request failed: %s" % str(e), status=code))
+    except socket.error, e:
+        info.update(dict(msg="Connection failure: %s" % str(e), status=-1))
+    except Exception, e:
+        info.update(dict(msg="An unknown error occurred: %s" % str(e), status=-1))
 
     return r, info
-
